@@ -306,4 +306,4 @@ MIT — see `LICENSE`.
 
 ---
 
-**Made with ❤️ by the KHOJ+ Team**
+**Made with ❤️ by the PrefiQ Team**
