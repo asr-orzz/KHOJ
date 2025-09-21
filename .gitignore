@@ -1,0 +1,90 @@
+# Node.js (CRITICAL - prevents node_modules upload!)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+.npm
+.eslintcache
+.next/
+out/
+build/
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Data and Models (too large for GitHub)
+data/
+models/
+processed_data/
+checkpoints/
+legendary_models/
+trained_models/
+*.pt
+*.pth
+*.parquet
+*.csv
+*.json.gz
+
+# Logs
+logs/
+training_logs/
+*.log
+
+# API Keys (security)
+kaggle.json
+.env
+config/secrets.py
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+debug_*.py
+test_*.py
+check_*.py
+fix_*.py
+validate_*.py
+
+# Large files and directories
+legendary_models/
+legendary_frontend/
+checkpoints/
+training_status.json
