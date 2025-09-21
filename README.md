@@ -115,8 +115,8 @@ A production-grade, Bharat-first platform for **autosuggest, search, and product
 ### Setup
 
 ```bash
-git clone https://github.com/yourorg/khoj-plus.git
-cd khoj+
+git clone https://github.com/yourorg/khoj.git
+cd khoj
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env   # then edit values
