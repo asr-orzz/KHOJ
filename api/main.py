@@ -1,6 +1,7 @@
 """
-Main FastAPI Application for Enhanced CADENCE System
-Provides real-time hyper-personalized autosuggest and product recommendations
+KHOJ+ Main FastAPI Application
+Bharat-first Search & Recommendations for Meesho
+Provides vernacular-aware autosuggest, trust-based ranking, and personalized recommendations
 """
 import asyncio
 import json
@@ -12,7 +13,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, APIRouter
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, APIRouter, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -25,15 +26,17 @@ from core.data_processor import DataProcessor
 from core.cadence_model import CADENCEModel, DynamicBeamSearch, create_cadence_model
 from core.personalization import PersonalizationEngine, UserEmbeddingModel, ProductReranker
 from core.ecommerce_autocomplete import ECommerceAutocompleteEngine, ProductSpecificQueryGenerator
+from core.vernacular_processor import VernacularProcessor, IntentTags
+from core.trust_ranking import TrustAwareRanker, TrustSignals, DeliverabilitySignals, PersonalizationSignals
 from training.train_models import CADENCETrainer
 
 logger = structlog.get_logger()
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="Enhanced CADENCE API",
-    description="Hyper-personalized search autosuggest and product recommendations",
-    version="1.0.0"
+    title="KHOJ+ API - Bharat-first Search & Recommendations",
+    description="Vernacular-aware autosuggest, trust-based ranking, and personalized recommendations for Meesho",
+    version="2.0.0"
 )
 
 # Add CORS middleware
@@ -45,10 +48,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# NOTE: The static React build should be mounted *after* API routes are registered
-from pathlib import Path
-build_dir = Path(__file__).parent.parent / "frontend" / "build"
-
 # Global variables for models
 cadence_model: Optional[CADENCEModel] = None
 personalization_engine: Optional[PersonalizationEngine] = None
@@ -56,9 +55,102 @@ product_reranker: Optional[ProductReranker] = None
 beam_search: Optional[DynamicBeamSearch] = None
 data_processor: Optional[DataProcessor] = None
 ecommerce_autocomplete: Optional[ECommerceAutocompleteEngine] = None
+vernacular_processor: Optional[VernacularProcessor] = None
+trust_ranker: Optional[TrustAwareRanker] = None
 product_database: List[Dict[str, Any]] = []
 
-# Request/Response Models
+# Request/Response Models for KHOJ+
+
+class IntentChip(BaseModel):
+    type: str = Field(..., description="Type of chip (price, quality, delivery, etc.)")
+    label: str = Field(..., description="Display label for chip")
+    value: str = Field(..., description="Value for filtering")
+
+class AutosuggestRequest(BaseModel):
+    query_prefix: str = Field(..., min_length=1, max_length=100, description="Query prefix for suggestions")
+    max_suggestions: int = Field(default=10, ge=1, le=20, description="Maximum number of suggestions")
+    session_id: Optional[str] = Field(None, description="Session ID for personalization")
+    user_id: Optional[str] = Field(None, description="User ID for personalization")
+    user_pincode: Optional[str] = Field(None, description="User pincode for delivery-aware suggestions")
+    include_personalization: bool = Field(default=True, description="Whether to include personalization")
+    language_preference: Optional[str] = Field(default="en", description="Language preference (en, hi, hinglish)")
+
+class AutosuggestResponse(BaseModel):
+    suggestions: List[str] = Field(..., description="Autocomplete suggestions")
+    intent_chips: List[IntentChip] = Field(default=[], description="Intent chips for UI")
+    original_query: str = Field(..., description="Original query prefix")
+    normalized_query: str = Field(..., description="Normalized query after processing")
+    session_id: str = Field(..., description="Session ID")
+    processing_time_ms: float = Field(..., description="Processing time in milliseconds")
+    has_vernacular_processing: bool = Field(default=False, description="Whether vernacular processing was applied")
+
+class SearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=200, description="Search query")
+    max_results: int = Field(default=20, ge=1, le=100, description="Maximum number of results")
+    user_id: Optional[str] = Field(None, description="User ID for personalization")
+    session_id: Optional[str] = Field(None, description="Session ID")
+    user_pincode: Optional[str] = Field(None, description="User pincode for delivery-aware ranking")
+    price_range: Optional[Dict[str, float]] = Field(None, description="Price range filter")
+    category_filter: Optional[str] = Field(None, description="Category filter")
+    sort_by: str = Field(default="relevance", description="Sort criteria")
+    filters: Optional[Dict[str, Any]] = Field(default={}, description="Additional filters")
+    include_strips: bool = Field(default=True, description="Whether to include SRP strips")
+
+class ProductResult(BaseModel):
+    product_id: str = Field(..., description="Product ID")
+    title: str = Field(..., description="Product title")
+    brand: Optional[str] = Field(None, description="Brand name")
+    category: str = Field(..., description="Product category")
+    price: Optional[float] = Field(None, description="Product price")
+    rating: Optional[float] = Field(None, description="Product rating")
+    review_count: Optional[int] = Field(None, description="Number of reviews")
+    relevance_score: float = Field(..., description="Relevance score")
+    ranking_score: float = Field(..., description="Final ranking score")
+    trust_signals: Optional[Dict[str, Any]] = Field(None, description="Trust signals")
+    deliverability: Optional[Dict[str, Any]] = Field(None, description="Deliverability info")
+    image_url: Optional[str] = Field(None, description="Product image URL")
+    seller_id: Optional[str] = Field(None, description="Seller ID")
+    seller_name: Optional[str] = Field(None, description="Seller name")
+    is_meesho_mall: bool = Field(default=False, description="Is Meesho Mall product")
+    cod_available: bool = Field(default=True, description="COD availability")
+    return_policy: Optional[str] = Field(None, description="Return policy")
+    pincode_eta: Optional[int] = Field(None, description="Delivery ETA in days")
+
+class SRPStrip(BaseModel):
+    title: str = Field(..., description="Strip title")
+    products: List[ProductResult] = Field(..., description="Products in strip")
+
+class SearchResponse(BaseModel):
+    results: List[ProductResult] = Field(..., description="Search results")
+    strips: Optional[List[SRPStrip]] = Field(default=[], description="SRP strips")
+    query: str = Field(..., description="Search query")
+    normalized_query: str = Field(..., description="Normalized query")
+    total_results: int = Field(..., description="Total number of results")
+    processing_time_ms: float = Field(..., description="Processing time")
+    intent_detected: Optional[Dict[str, Any]] = Field(None, description="Detected intent")
+    applied_filters: Dict[str, Any] = Field(default={}, description="Applied filters")
+    session_id: str = Field(..., description="Session ID")
+
+class UserBehaviorEvent(BaseModel):
+    user_id: Optional[str] = Field(None, description="User ID")
+    session_id: str = Field(..., description="Session ID")
+    event_type: str = Field(..., description="Event type (click, view, purchase, etc.)")
+    query: Optional[str] = Field(None, description="Associated query")
+    product_id: Optional[str] = Field(None, description="Associated product ID")
+    timestamp: datetime = Field(default_factory=datetime.now, description="Event timestamp")
+    metadata: Optional[Dict[str, Any]] = Field(default={}, description="Additional event metadata")
+
+class ExperimentRequest(BaseModel):
+    experiment_name: str = Field(..., description="Experiment name")
+    user_id: Optional[str] = Field(None, description="User ID")
+    session_id: str = Field(..., description="Session ID")
+    context: Optional[Dict[str, Any]] = Field(default={}, description="Experiment context")
+
+class ExperimentResponse(BaseModel):
+    experiment_name: str = Field(..., description="Experiment name")
+    treatment: str = Field(..., description="Assigned treatment")
+    session_id: str = Field(..., description="Session ID")
+    metadata: Optional[Dict[str, Any]] = Field(default={}, description="Experiment metadata")
 class AutosuggestRequest(BaseModel):
     query_prefix: str = Field(..., description="The prefix user has typed")
     user_id: str = Field(..., description="Unique user identifier")

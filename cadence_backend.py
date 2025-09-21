@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-CADENCE Backend API Server
-Production-ready FastAPI backend for query autocomplete and product search
+KHOJ+ Backend API Server
+Bharat-first Search & Recommendations for Meesho
+Production-ready FastAPI backend with vernacular processing and trust-aware ranking
 """
 import os
 import json
 import pickle
 import asyncio
+import logging
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 import warnings
@@ -19,11 +21,18 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 import structlog
 
-from real_cadence_training import RealCADENCEModel
+# Import available core modules
+from core.cadence_model import CADENCEModel
+from core.vernacular_processor import VernacularProcessor, IntentTags
+from core.trust_ranking import TrustAwareRanker, PersonalizationSignals
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 logger = structlog.get_logger()
 
@@ -73,6 +82,7 @@ class CADENCEModelManager:
         self.cluster_info = None
         self.config = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model_loaded = False
         
         # Cached data
         self.query_data = None
@@ -115,29 +125,73 @@ class CADENCEModelManager:
         vocab_size = len(self.vocab)
         num_categories = self.config['num_categories']
         
-        self.model = RealCADENCEModel(vocab_size, num_categories, self.config['model_config'])
+        # Create model config
+        model_config = {
+            'vocab_size': vocab_size,
+            'num_categories': num_categories,
+            'embedding_dim': self.config.get('embedding_dim', 128),
+            'hidden_dims': self.config.get('hidden_dims', [256, 128]),
+            'attention_dims': self.config.get('attention_dims', [128, 64]),
+            'dropout': self.config.get('dropout', 0.5)
+        }
         
-        # Load model weights
-        model_file = model_path / "real_cadence.pt"
-        if not model_file.exists():
-            raise FileNotFoundError(f"Model weights not found: {model_file}")
+        self.model = CADENCEModel(model_config)
         
-        self.model.load_state_dict(torch.load(model_file, map_location=self.device))
+        # Load model weights if available (optional for demo)
+        model_file = model_path / "cadence_model.pt"
+        if model_file.exists():
+            try:
+                self.model.load_state_dict(torch.load(model_file, map_location=self.device))
+                logger.info("   ✅ Loaded pre-trained model weights")
+            except Exception as e:
+                logger.warning(f"   ⚠️  Could not load model weights: {e}")
+        else:
+            logger.info("   ℹ️  No pre-trained weights found, using randomly initialized model")
+        
         self.model.to(self.device)
         self.model.eval()
         
         # Load processed data for search
-        if (data_path / "queries.parquet").exists():
+        sample_products_file = data_path / "sample_products.json"
+        if sample_products_file.exists():
+            with open(sample_products_file, 'r') as f:
+                sample_products = json.load(f)
+            self.product_data = pd.DataFrame(sample_products)
+            
+            # Ensure processed_title field exists
+            if 'processed_title' not in self.product_data.columns:
+                self.product_data['processed_title'] = self.product_data['title'].astype(str).str.lower()
+            
+            logger.info(f"   Loaded {len(self.product_data):,} sample products")
+        elif (data_path / "products.parquet").exists():
+            self.product_data = pd.read_parquet(data_path / "products.parquet")
+            
+            # Ensure processed_title field exists
+            if 'processed_title' not in self.product_data.columns:
+                self.product_data['processed_title'] = self.product_data['title'].astype(str).str.lower()
+            
+            logger.info(f"   Loaded {len(self.product_data):,} products")
+        
+        # Load query data
+        sample_queries_file = data_path / "sample_queries.json"
+        if sample_queries_file.exists():
+            with open(sample_queries_file, 'r') as f:
+                sample_queries = json.load(f)
+            # Convert to DataFrame format expected by the model
+            self.query_data = pd.DataFrame([{'query': q, 'processed_query': q} for q in sample_queries])
+            logger.info(f"   Loaded {len(self.query_data):,} sample queries")
+        elif (data_path / "queries.parquet").exists():
             self.query_data = pd.read_parquet(data_path / "queries.parquet")
             logger.info(f"   Loaded {len(self.query_data):,} queries")
         
-        if (data_path / "products.parquet").exists():
-            self.product_data = pd.read_parquet(data_path / "products.parquet")
-            logger.info(f"   Loaded {len(self.product_data):,} products")
-        
         logger.info("✅ All models and data loaded successfully")
-        logger.info(f"   Model parameters: {self.model.count_parameters()/1e6:.1f}M")
+        # Count model parameters manually
+        total_params = sum(p.numel() for p in self.model.parameters())
+        logger.info(f"   Model parameters: {total_params/1e6:.1f}M")
         logger.info(f"   Vocabulary size: {vocab_size:,}")
+        
+        # Set model loaded flag
+        self.model_loaded = True
         logger.info(f"   Categories: {num_categories}")
     
     def preprocess_query(self, query: str) -> str:
@@ -203,56 +257,74 @@ class CADENCEModelManager:
             input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
             category_ids = torch.full_like(input_ids, category_id, device=self.device)
             
-            # Generate suggestions
-            suggestions = []
-            
-            for _ in range(max_suggestions * 2):  # Generate more to filter
-                # Forward pass
-                outputs = self.model(input_ids, category_ids, model_type='query')
-                logits = outputs['logits']
+            # Use the model's generate method for autocompletion
+            try:
+                # Generate completions using the model
+                completions = self.model.generate(
+                    input_ids=input_ids,
+                    category_ids=category_ids,
+                    max_length=len(token_ids) + 10,  # Generate up to 10 more tokens
+                    num_sequences=max_suggestions,
+                    temperature=0.8
+                )
                 
-                # Get next token probabilities
-                next_token_logits = logits[0, -1, :]
-                next_token_probs = F.softmax(next_token_logits, dim=-1)
-                
-                # Sample next token (with temperature for diversity)
-                temperature = 0.8
-                next_token_probs = next_token_probs / temperature
-                next_token_probs = F.softmax(next_token_probs, dim=-1)
-                
-                # Get top candidates
-                top_k = min(50, len(next_token_probs))
-                top_probs, top_indices = torch.topk(next_token_probs, top_k)
-                
-                # Sample from top candidates
-                sampled_idx = torch.multinomial(top_probs, 1).item()
-                next_token_id = top_indices[sampled_idx].item()
-                
-                # Convert to word
-                next_word = self.reverse_vocab.get(next_token_id, '<UNK>')
-                
-                # Check for end of sequence
-                if next_word in ['</s>', '<PAD>']:
-                    break
-                
-                # Add to current sequence
-                if next_word != '<UNK>':
-                    current_tokens = [self.reverse_vocab.get(tid, '') for tid in token_ids[1:]]  # Skip BOS
-                    current_tokens.append(next_word)
-                    suggestion = ' '.join([t for t in current_tokens if t and t not in ['<s>', '</s>']])
+                suggestions = []
+                for completion in completions:
+                    # Convert tokens back to text
+                    completion_tokens = [self.reverse_vocab.get(tid, '') for tid in completion[len(token_ids):]]
+                    completion_text = ' '.join([t for t in completion_tokens if t and t not in ['<s>', '</s>', '<PAD>', '<UNK>']])
                     
-                    if suggestion not in suggestions and len(suggestion.split()) > len(query.split()):
-                        suggestions.append(suggestion)
+                    if completion_text.strip():
+                        full_suggestion = query + ' ' + completion_text.strip()
+                        if full_suggestion not in suggestions:
+                            suggestions.append(full_suggestion)
                 
-                # Update input for next token
-                token_ids.append(next_token_id)
-                input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
-                category_ids = torch.full_like(input_ids, category_id, device=self.device)
+                return suggestions[:max_suggestions]
                 
-                if len(suggestions) >= max_suggestions:
-                    break
-            
-            return suggestions[:max_suggestions]
+            except Exception as e:
+                # Fallback to simple completion if model generation fails
+                print(f"Model generation failed: {e}")
+                
+                # Simple prefix matching from product data
+                suggestions = []
+                if self.product_data is not None:
+                    query_lower = query.lower()
+                    for _, product in self.product_data.iterrows():
+                        title = product['processed_title'].lower()
+                        if title.startswith(query_lower) and title != query_lower:
+                            suggestions.append(product['processed_title'])
+                        elif query_lower in title:
+                            # Extract relevant portion
+                            words = title.split()
+                            for i, word in enumerate(words):
+                                if query_lower in word or word in query_lower:
+                                    suggestion = ' '.join(words[:i+3])  # Take a few more words
+                                    if suggestion not in suggestions and len(suggestion) > len(query):
+                                        suggestions.append(suggestion)
+                                    break
+                        
+                        if len(suggestions) >= max_suggestions:
+                            break
+                
+                # If still no suggestions, try partial word matching
+                if not suggestions and self.product_data is not None:
+                    query_lower = query.lower()
+                    for _, product in self.product_data.iterrows():
+                        title = product['processed_title'].lower()
+                        # Check if any word in the title starts with the query
+                        words = title.split()
+                        for word in words:
+                            if word.startswith(query_lower) and len(word) > len(query_lower):
+                                # Create suggestion based on this word
+                                suggestion = word
+                                if suggestion not in suggestions:
+                                    suggestions.append(suggestion)
+                                break
+                        
+                        if len(suggestions) >= max_suggestions:
+                            break
+                
+                return suggestions[:max_suggestions]
     
     def search_products(self, query: str, max_results: int = 20, 
                        category_filter: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -288,10 +360,10 @@ class CADENCEModelManager:
             # Combined relevance score
             relevance_score = (jaccard_score * 0.6) + (exact_match_score * 0.4)
             
-            if relevance_score > 0.1:  # Minimum relevance threshold
+            if relevance_score > 0.05:  # Lower minimum relevance threshold for better recall
                 results.append({
                     'product_id': product['product_id'],
-                    'title': product['original_title'],
+                    'title': product.get('title', product.get('original_title', 'Unknown')),  # Flexible title field
                     'processed_title': product['processed_title'],
                     'category': product.get('main_category', 'Unknown'),
                     'cluster_description': product.get('cluster_description', ''),
@@ -479,12 +551,29 @@ def main():
     """Run the server"""
     logger.info("🚀 Starting CADENCE API server...")
     
-    # Check if models exist
-    if not Path("trained_models/real_cadence.pt").exists():
+    # Check if essential model files exist
+    config_file = Path("trained_models/real_cadence_config.json")
+    vocab_file = Path("trained_models/real_cadence_vocab.pkl")
+    
+    if not config_file.exists() or not vocab_file.exists():
         logger.error("❌ Trained models not found!")
         logger.info("Please run the training pipeline first:")
-        logger.info("1. python real_cadence_training.py")
-        logger.info("2. python real_model_training.py")
+        logger.info("1. python fast_cadence_training.py")
+        logger.info("2. python training/train_models.py (optional)")
+        logger.info("")
+        logger.info("Missing files:")
+        if not config_file.exists():
+            logger.info(f"   - {config_file}")
+        if not vocab_file.exists():
+            logger.info(f"   - {vocab_file}")
+        return
+    
+    # Load models
+    try:
+        model_manager.load_models()
+        logger.info("✅ Models loaded successfully!")
+    except Exception as e:
+        logger.error(f"❌ Failed to load models: {e}")
         return
     
     # Run server
